@@ -13,13 +13,13 @@
 # limitations under the License.
 
 """Data for AlphaFold."""
-import numpy as np
-import tensorflow.compat.v1 as tf
 
 from alphafold.common import residue_constants
 from alphafold.model.tf import shape_helpers
 from alphafold.model.tf import shape_placeholders
 from alphafold.model.tf import utils
+import numpy as np
+import tensorflow.compat.v1 as tf
 
 # Pylint gets confused by the curry1 decorator because it changes the number
 #   of arguments to the function.
@@ -253,7 +253,7 @@ def nearest_neighbor_clusters(protein, gap_agreement_weight=0.):
   """Assign each extra MSA sequence to its nearest neighbor in sampled MSA."""
 
   # Determine how much weight we assign to each agreement.  In theory, we could
-  # use a full blosum matrix here, but right now let's just down-weight gap
+  # use a full BLOSUM matrix here, but right now let's just down-weight gap
   # agreement because it could be spurious.
   # Never put weight on agreeing on BERT mask
   weights = tf.concat([
@@ -623,4 +623,3 @@ def make_atom14_masks(protein):
   protein['atom37_atom_exists'] = residx_atom37_mask
 
   return protein
-
