@@ -187,7 +187,7 @@ class AF2_runner():
         model_config = config.model_config(self.model_name)        
         model_config.model.num_ensemble_eval = 1
 
-        model_config.model.embeddings_and_evoformer.initial_guess = False
+        model_config.model.embeddings_and_evoformer.initial_guess = False if args.no_initial_guess else True
 
         params_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),'model_weights')
 

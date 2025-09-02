@@ -290,7 +290,9 @@ class AlphaFold(hk.Module):
       is_training,
       compute_loss=False,
       ensemble_representations=False,
-      return_representations=False):
+      return_representations=False,
+      initial_guess=None
+      ):
     """Run the AlphaFold model.
 
     Arguments:
@@ -352,6 +354,8 @@ class AlphaFold(hk.Module):
     if emb_config.recycle_pos:
       prev['prev_pos'] = jnp.zeros(
           [num_residues, residue_constants.atom_type_num, 3])
+      if emb_config.initial_guess:
+        prev['prev_pos'] += initial_guess
     if emb_config.recycle_features:
       prev['prev_msa_first_row'] = jnp.zeros(
           [num_residues, emb_config.msa_channel])
