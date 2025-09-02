@@ -89,7 +89,7 @@ def generate_template_features(
         output_templates_sequence, residue_constants.HHBLITS_AA_TO_ID)
 
     template_feat_dict = {'template_all_atom_positions': np.array(templates_all_atom_positions)[None],
-        'template_all_atom_masks': np.array(templates_all_atom_masks)[None],
+        'template_all_atom_mask': np.array(templates_all_atom_masks)[None],
         'template_sequence': [output_templates_sequence.encode()],
         'template_aatype': np.array(templates_aatype)[None],
         'template_confidence_scores': np.array(output_confidence_scores)[None],
@@ -250,17 +250,14 @@ def insert_Rosetta_chainbreaks( pose, binderlen ) -> core.pose.Pose:
 
         binderlen (list) : The length of the binder chain
     '''
-
     conf = pose.conformation()
     conf.insert_chain_ending( binderlen )
-
     pose.set_new_conformation( conf )
-
     splits = pose.split_by_chain()
     newpose = splits[1]
     for i in range( 2, len( splits )+1 ):
         newpose.append_pose_by_jump( splits[i], newpose.size() )
- 
+    
     info = core.pose.PDBInfo( newpose, True )
     newpose.pdb_info( info )
 
@@ -295,8 +292,7 @@ def check_residue_distances(all_positions, all_positions_mask, max_amide_distanc
                     # This chainbreak is listed as being at residue i in zero-indexed numbering.
                     breaks.append(i)
                     print( f'The distance between residues {i} and {i+1} is {distance:.2f} A' +
-                        f' > limit {max_amide_distance} A.' )
-                    print( f"I'm going to insert a chainbreak after residue {i}" )
+                        f' > limit {max_amide_distance} A. Going to insert a chainbreak after residue {i}...' )
 
             prev_c = coords[c_position]
 

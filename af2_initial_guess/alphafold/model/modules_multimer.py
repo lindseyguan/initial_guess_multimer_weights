@@ -422,6 +422,7 @@ class AlphaFold(hk.Module):
       batch,
       is_training,
       return_representations=False,
+      initial_guess=None,
       safe_key=None):
 
     c = self.config
@@ -456,6 +457,8 @@ class AlphaFold(hk.Module):
     if emb_config.recycle_pos:
       prev['prev_pos'] = jnp.zeros(
           [num_res, residue_constants.atom_type_num, 3])
+      if emb_config.initial_guess: # Apply initial guess
+        prev['prev_pos'] += initial_guess
     if emb_config.recycle_features:
       prev['prev_msa_first_row'] = jnp.zeros(
           [num_res, emb_config.msa_channel])
@@ -705,6 +708,7 @@ class EmbeddingsAndEvoformer(hk.Module):
       # Extra MSA stack.
       (extra_msa_feat,
        extra_msa_mask) = create_extra_msa_feature(batch, c.num_extra_msa)
+
       extra_msa_activations = common_modules.Linear(
           c.extra_msa_channel,
           name='extra_msa_activations')(

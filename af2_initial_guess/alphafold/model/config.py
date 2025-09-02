@@ -31,7 +31,7 @@ def model_config(name: str) -> ml_collections.ConfigDict:
   if 'multimer' in name:
     cfg = copy.deepcopy(CONFIG_MULTIMER)
   else:
-    cfg = copy.deepcopy(CONFIG)
+    raise ValueError(f'Invalid model name {name}. This version of initial guess cannot support monomer weights.')
   cfg.update_from_flattened_dict(CONFIG_DIFFS[name])
   return cfg
 
@@ -531,6 +531,7 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
                     'fuse_projection_weights': True,
                 }
             },
+            'initial_guess': False,
             'extra_msa_channel': 64,
             'extra_msa_stack_num_block': 4,
             'num_msa': 508,
@@ -687,7 +688,7 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
             }
         },
         'num_ensemble_eval': 1,
-        'num_recycle': 20,
+        'num_recycle': 3,
         # A negative value indicates that no early stopping will occur, i.e.
         # the model will always run `num_recycle` number of recycling
         # iterations.  A positive value will enable early stopping if the

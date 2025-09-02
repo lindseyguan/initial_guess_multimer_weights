@@ -17,7 +17,7 @@ from jax.lib import xla_bridge
 from alphafold.common import residue_constants
 from alphafold.common import protein
 from alphafold.common import confidence
-from alphafold.data import pipeline
+from alphafold.data import pipeline, pipeline_multimer
 from alphafold.model import data
 from alphafold.model import config
 from alphafold.model import model
@@ -56,9 +56,11 @@ parser.add_argument( "-debug", action="store_true", default=False, help='When ac
 parser.add_argument( "-max_amide_dist", type=float, default=3.0, help='The maximum distance between an amide bond\'s carbon and nitrogen (default: 3.0)' )
 parser.add_argument( "-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)' )
 parser.add_argument( "-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)' )
-parser.add_argument( "-force_monomer", action="store_true", default=False, help='When active, the model will predict the structure of a monomer (default: False)' )
+parser.add_argument( "-fix_binder", action="store_true", default=False, help="Fixes the binder structure, in addition to the target structure")
+parser.add_argument( "-weights", type=str, default="model_1_multimer_v3", help="Which model to use")
 
 args = parser.parse_args()
+
 
 class FeatureHolder():
     '''
@@ -72,16 +74,96 @@ class FeatureHolder():
         
         self.seq       = pose.sequence()
         self.binderlen = binderlen
-        self.monomer   = monomer
+        self.querylen  = len(self.seq)
+        self.targetlen = self.querylen - self.binderlen
         
         # Pre model features
         self.initial_all_atom_positions = None
         self.initial_all_atom_masks = None
 
+        self.monomer = monomer
+
         # Post model features
         self.outpose     = None
         self.plddt_array = None
         self.score_dict  = None
+
+
+    def _make_msa(self, aatype):
+        header = aatype
+        unpaired_binder = np.concatenate([aatype[:self.binderlen], 
+                                          np.full((self.targetlen), 21, dtype=np.int32)
+                                         ])
+        unpaired_target = np.concatenate([np.full((self.binderlen), 21, dtype=np.int32),
+                                          aatype[self.binderlen:] 
+                                         ])
+        unpaired_padding = [np.full((self.querylen), 21, dtype=np.int32) for i in range(2)]
+
+        return np.stack([header, unpaired_binder, unpaired_target] + unpaired_padding)
+
+
+    def process_features(self):
+        """
+        Makes feature_dict for AF2 input
+        """
+        aatype = residue_constants.sequence_to_onehot(sequence=self.seq,
+                                                      mapping=residue_constants.restype_order_with_x,
+                                                      map_unknown_to_x=True
+                                                     )
+        # The multimer model performs the one-hot operation itself.
+        aatype = np.argmax(aatype, axis=-1).astype(np.int32)
+
+        binder_residue_index = np.array(range(self.binderlen), dtype=np.int32)
+        target_residue_index = np.array(range(self.targetlen), dtype=np.int32)
+        residue_index = np.concatenate([binder_residue_index, target_residue_index], dtype=np.int32)
+
+        seq_length = np.array(self.querylen, dtype=np.int32)
+
+        msa = self._make_msa(aatype)
+        
+        num_alignments = np.array(3)
+
+        asym_id = np.concatenate([np.full((self.binderlen), 1), np.full((self.targetlen), 2)])
+        entity_id = asym_id
+        sym_id = np.full((self.querylen), 1)
+
+        deletion_matrix = np.zeros(msa.shape, dtype=np.float32)
+        deletion_mean = np.zeros(self.querylen, dtype=np.float32)
+
+        assembly_num_chains = np.array(2)
+        entity_mask = np.ones(self.querylen, dtype=np.int32)
+        cluster_bias_mask = np.array([1, 0, 0, 0, 0])
+        bert_mask = msa.copy()
+        bert_mask[bert_mask == 21] == 0
+        seq_mask = np.ones(self.querylen, dtype=np.float32)
+
+        msa_unmasked = [np.ones(self.querylen) for i in range(3)]
+        msa_masked = [np.zeros(self.querylen) for i in range(2)]
+        msa_mask = np.stack(msa_unmasked + msa_masked)
+
+        feature_dict = {'aatype':aatype,
+                        'residue_index':residue_index,
+                        'seq_length':seq_length,
+                        'msa':msa,
+                        'num_alignments':num_alignments,
+                        'asym_id':asym_id,
+                        'sym_id':sym_id,
+                        'entity_id':entity_id,
+                        'deletion_matrix':deletion_matrix,
+                        'deletion_mean':deletion_mean,
+                        'assembly_num_chains':assembly_num_chains,
+                        'entity_mask':entity_mask,
+                        'cluster_bias_mask':cluster_bias_mask,
+                        'bert_mask':bert_mask,
+                        'seq_mask':seq_mask,
+                        'msa_mask':msa_mask
+                       }
+
+        # Pad MSA to avoid zero-sized extra_msa.
+        feature_dict = pipeline_multimer.pad_msa(feature_dict, 512)
+
+        return feature_dict
+
 
 class AF2_runner():
     '''
@@ -98,24 +180,21 @@ class AF2_runner():
         self.struct_manager = struct_manager
 
         # Other models may be run but their weights will also need to be downloaded
-        self.model_name = "model_1_ptm"
+        self.model_name = args.weights
 
-        model_config = config.model_config(self.model_name)
-        model_config.data.eval.num_ensemble = 1
+        self.fix_binder = args.fix_binder
 
-        model_config.data.common.num_recycle = args.recycle
-        model_config.model.num_recycle = args.recycle
+        model_config = config.model_config(self.model_name)        
+        model_config.model.num_ensemble_eval = 1
 
-        model_config.model.embeddings_and_evoformer.initial_guess = False if args.no_initial_guess else True
-
-        model_config.data.common.max_extra_msa = 5
-        model_config.data.eval.max_msa_clusters = 5
+        model_config.model.embeddings_and_evoformer.initial_guess = False
 
         params_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),'model_weights')
 
         model_params = data.get_model_haiku_params(model_name=self.model_name, data_dir=params_dir)
 
         self.model_runner = model.RunModel(model_config, model_params)
+
 
     def featurize(self, feat_holder) -> None:
 
@@ -127,9 +206,9 @@ class AF2_runner():
         initial_guess = af2_util.parse_initial_guess(feat_holder.initial_all_atom_positions)
 
         # Determine which residues to template
-        if feat_holder.monomer:
-            # For monomers predict all residues
-            feat_holder.residue_mask = [False for i in range(len(feat_holder.seq))]
+        if self.fix_binder:
+            # If binder and target are both fixed, then fix all residues
+            feat_holder.residue_mask = [True for i in range(len(feat_holder.seq))]
         else:
             # For interfaces fix the target and predict the binder
             feat_holder.residue_mask = [int(i) > feat_holder.binderlen for i in range(len(feat_holder.seq))]
@@ -141,29 +220,29 @@ class AF2_runner():
                                                             feat_holder.residue_mask
                                                            )
         # Gather features
-        feature_dict = {
-            **pipeline.make_sequence_features(sequence=feat_holder.seq,
-                                            description="none",
-                                            num_res=len(feat_holder.seq)),
-            **pipeline.make_msa_features(msas=[[feat_holder.seq]],
-                                        deletion_matrices=[[[0]*len(feat_holder.seq)]]),
-            **template_dict
-        }
+        feature_dict = feat_holder.process_features()
+        for template_feature in ['template_all_atom_positions', 'template_all_atom_mask', 'template_aatype']:
+            if 'aatype' in template_feature:
+                feature_dict[template_feature] = np.argmax(template_dict[template_feature], 
+                                                           axis=-1).astype(np.int32)
+            else:
+                feature_dict[template_feature] = template_dict[template_feature]
+        feature_dict['num_templates'] = np.array(1)
+        feature_dict['all_atom_mask'] = all_atom_masks
+        feature_dict['all_atom_positions'] = all_atom_positions
 
-        if feat_holder.monomer:
-            breaks = []
-        else:
-            breaks = af2_util.check_residue_distances(
-                            feat_holder.initial_all_atom_positions,
-                            feat_holder.initial_all_atom_masks,
-                            self.max_amide_dist
-                        )
+        breaks = af2_util.check_residue_distances(
+                        feat_holder.initial_all_atom_positions,
+                        feat_holder.initial_all_atom_masks,
+                        self.max_amide_dist
+                    )
 
         feature_dict['residue_index'] = af2_util.insert_truncations(feature_dict['residue_index'], breaks)
 
         feature_dict = self.model_runner.process_features(feature_dict, random_seed=0)
 
         return feature_dict, initial_guess 
+
 
     def generate_scoredict(self, feat_holder, confidences, rmsds) -> None:
         '''
@@ -176,25 +255,16 @@ class AF2_runner():
         plddt_array = confidences['plddt']
         plddt = np.mean( plddt_array )
 
-        if feat_holder.monomer:
-            plddt_binder = np.mean( plddt_array )
-            plddt_target = float('nan')
-        else:
-            plddt_binder = np.mean( plddt_array[:binderlen] )
-            plddt_target = np.mean( plddt_array[binderlen:] )
+        plddt_binder = np.mean( plddt_array[:binderlen] )
+        plddt_target = np.mean( plddt_array[binderlen:] )
 
         pae = confidences['predicted_aligned_error']
 
-        if feat_holder.monomer:
-            pae_binder = np.mean( pae )
-            pae_target = float('nan')
-            pae_interaction_total = float('nan')
-        else:
-            pae_interaction1 = np.mean( pae[:binderlen,binderlen:] )
-            pae_interaction2 = np.mean( pae[binderlen:,:binderlen] )
-            pae_binder = np.mean( pae[:binderlen,:binderlen] )
-            pae_target = np.mean( pae[binderlen:,binderlen:] )
-            pae_interaction_total = ( pae_interaction1 + pae_interaction2 ) / 2
+        pae_interaction1 = np.mean( pae[:binderlen,binderlen:] )
+        pae_interaction2 = np.mean( pae[binderlen:,:binderlen] )
+        pae_binder = np.mean( pae[:binderlen,:binderlen] )
+        pae_target = np.mean( pae[binderlen:,binderlen:] )
+        pae_interaction_total = ( pae_interaction1 + pae_interaction2 ) / 2
 
         time = timer() - self.t0
 
@@ -205,8 +275,10 @@ class AF2_runner():
                 "pae_binder" : pae_binder,
                 "pae_target" : pae_target,
                 "pae_interaction" : pae_interaction_total,
+                "iptm": confidences['iptm'],
+                "ptm": confidences['ptm'],
                 "binder_aligned_rmsd": rmsds['binder_aligned_rmsd'],
-                "target_aligned_rmsd": rmsds['target_aligned_rmsd'],
+                "target_aligned_rmsd": rmsds['target_aligned_rmsd'],                
                 "time" : time
         }
 
@@ -218,8 +290,8 @@ class AF2_runner():
 
         self.struct_manager.record_scores(feat_holder.outtag, score_dict, string_dict)
 
-        print(score_dict)
         print(f"Tag: {feat_holder.outtag} reported success in {time} seconds")
+
 
     def process_output(self, feat_holder, feature_dict, prediction_result) -> None:
         '''
@@ -229,21 +301,22 @@ class AF2_runner():
 
         # First extract the structure and confidence scores from the prediction result
         structure_module = prediction_result['structure_module']
-        this_protein = protein.Protein(
-            aatype=feature_dict['aatype'][0],
-            atom_positions=structure_module['final_atom_positions'][...],
-            atom_mask=structure_module['final_atom_mask'][...],
-            residue_index=feature_dict['residue_index'][0] + 1,
-            b_factors=np.zeros_like(structure_module['final_atom_mask'][...]) )
 
-        confidences = {}
-        confidences['distogram'] = prediction_result['distogram']
-        confidences['plddt'] = confidence.compute_plddt(
-                prediction_result['predicted_lddt']['logits'][...])
-        if 'predicted_aligned_error' in prediction_result:
-            confidences.update(confidence.compute_predicted_aligned_error(
-                prediction_result['predicted_aligned_error']['logits'][...],
-                prediction_result['predicted_aligned_error']['breaks'][...]))
+        confidences = {'plddt':prediction_result['plddt'],
+                       'predicted_aligned_error':prediction_result['predicted_aligned_error'],
+                       'ptm':prediction_result['ptm'],
+                       'iptm':prediction_result['iptm'],
+                       'ranking_confidence':prediction_result['ranking_confidence']
+                      }
+
+        this_protein = protein.Protein(
+            aatype=feature_dict['aatype'],
+            atom_positions=structure_module['final_atom_positions'],
+            atom_mask=structure_module['final_atom_mask'],
+            residue_index=feature_dict['residue_index'] + 1,
+            chain_index=feature_dict['entity_id'] - 1,
+            b_factors=np.zeros_like(structure_module['final_atom_mask']) 
+            )
         
         feat_holder.plddt_array = confidences['plddt']
 
@@ -269,8 +342,9 @@ class AF2_runner():
         
         # Now we can finally write the scores and the predicted structure to disk
         self.generate_scoredict(feat_holder, confidences, rmsds)
+
         self.struct_manager.dump_pose(feat_holder)
-    
+
     def process_struct(self, tag) -> None:
 
         # Start the timer
@@ -283,23 +357,24 @@ class AF2_runner():
         feat_holder = FeatureHolder(pose, monomer, binderlen, usetag)
 
         print(f'Processing struct with tag: {feat_holder.tag}')
+        print(f'Binder len: {feat_holder.binderlen}, Target len: {feat_holder.targetlen}, Total len: {feat_holder.querylen}')
 
         # Generate features
         feature_dict, initial_guess = self.featurize(feat_holder)
 
         # Run model
         start = timer()
-        print(f'Running {self.model_name}')
 
-        prediction_result = self.model_runner.apply( self.model_runner.params,
-                                                     jax.random.PRNGKey(0),
-                                                     feature_dict,
-                                                     initial_guess )
+        prediction_result = self.model_runner.predict(feature_dict,
+                                                      random_seed=0,
+                                                      initial_guess=initial_guess
+                                                     )
 
         print(f'Tag: {feat_holder.tag} finished AF2 prediction in {timer() - start} seconds')
 
         # Process outputs
         self.process_output(feat_holder, feature_dict, prediction_result)
+
 
 class StructManager():
     '''
@@ -318,8 +393,6 @@ class StructManager():
 
         # Generate a random unique temporary filename
         self.tmp_fn = f'tmp_{uuid.uuid4()}.pdb'
-
-        self.force_monomer = args.force_monomer
 
         self.silent = False
         if not args.silent == '':
@@ -429,16 +502,13 @@ class StructManager():
 
         af2_util.add2scorefile(tag, self.score_fn, write_header, score_dict, string_dict) 
 
+
     def dump_pose(self, feat_holder):
         '''
         Dump this pose to either a silent file or a pdb file depending on the input arguments
         '''
-        
-        if feat_holder.monomer:
-            pose = feat_holder.outpose
-        else:
-            # Insert chainbreaks into the pose
-            pose = af2_util.insert_Rosetta_chainbreaks(feat_holder.outpose, feat_holder.binderlen)
+        # Insert chainbreaks into the pose
+        pose = feat_holder.outpose
 
         # Add the plddt scores as b-factors to the pose
         info = pose.pdb_info()
@@ -469,6 +539,7 @@ class StructManager():
 
             self.sfd_out.add_structure(struct)
             self.sfd_out.write_silent_struct(struct, self.outsilent)
+
 
     def load_pose(self, tag):
         '''
@@ -515,18 +586,8 @@ class StructManager():
             binderlen = -1
 
         elif len(splits) == 2:
-            if self.force_monomer:
-                print( "/" * 60 ) 
-                print( f"Pose {tag} has two chains. But force_monomer is set to True. Treating as monomer.")
-                print( f"I am going to assume that the first chain is the binder and that is the chain I will predict")
-                print( "/" * 60 ) 
-
-                monomer   = True
-                pose      = splits[1]
-                binderlen = -1
-            else: 
-                monomer   = False
-                binderlen = splits[1].size()
+            monomer   = False
+            binderlen = splits[1].size()
 
         return pose, monomer, binderlen, usetag
 
