@@ -694,7 +694,12 @@ class EmbeddingsAndEvoformer(hk.Module):
         }
         # Construct a mask such that only intra-chain template features are
         # computed, since all templates are for each chain individually.
-        multichain_mask = batch['asym_id'][:, None] == batch['asym_id'][None, :]
+        # multichain_mask = batch['asym_id'][:, None] == batch['asym_id'][None, :]
+
+        # But for initial guess, we want to preserve inter-chain template features
+        multichain_mask_shape = batch['asym_id'].shape[0]
+        multichain_mask = jnp.ones((multichain_mask_shape, multichain_mask_shape), dtype=bool)
+
         safe_key, safe_subkey = safe_key.split()
         template_act = template_module(
             query_embedding=pair_activations,

@@ -531,11 +531,11 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
                     'fuse_projection_weights': True,
                 }
             },
-            'initial_guess': False,
+            'initial_guess': True,
             'extra_msa_channel': 64,
             'extra_msa_stack_num_block': 4,
-            'num_msa': 508,
-            'num_extra_msa': 2048,
+            'num_msa': 5,
+            'num_extra_msa': 5,
             'masked_msa': {
                 'profile_prob': 0.1,
                 'replace_fraction': 0.15,
@@ -694,7 +694,7 @@ CONFIG_MULTIMER = ml_collections.ConfigDict({
         # iterations.  A positive value will enable early stopping if the
         # difference in pairwise distances is less than the tolerance between
         # recycling steps.
-        'recycle_early_stop_tolerance': 0.5,
+        'recycle_early_stop_tolerance': -1,
         'resample_msa_in_recycling': True
     }
 })

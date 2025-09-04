@@ -2,7 +2,9 @@
 
 import os
 import numpy as np
+import json
 import sys
+import pickle
 
 from timeit import default_timer as timer
 import argparse
@@ -53,11 +55,13 @@ parser.add_argument( "-maintain_res_numbering", action="store_true", default=Fal
 parser.add_argument( "-debug", action="store_true", default=False, help='When active, errors will cause the script to crash and the error message to be printed out (default: False)')
 
 # AF2-Specific Arguments
+parser.add_argument( "-force_monomer", action="store_true", default=False, help="When true, complex will be treated as one chain.")
 parser.add_argument( "-max_amide_dist", type=float, default=3.0, help='The maximum distance between an amide bond\'s carbon and nitrogen (default: 3.0)' )
 parser.add_argument( "-recycle", type=int, default=3, help='The number of AF2 recycles to perform (default: 3)' )
 parser.add_argument( "-no_initial_guess", action="store_true", default=False, help='When active, the model will not use an initial guess (default: False)' )
 parser.add_argument( "-fix_binder", action="store_true", default=False, help="Fixes the binder structure, in addition to the target structure")
 parser.add_argument( "-weights", type=str, default="model_1_multimer_v3", help="Which model to use")
+parser.add_argument( "-save_score_dir", type=str, default="", help="If set, will save score files to the directory specified. Otherwise, scores are not saved")
 
 args = parser.parse_args()
 
@@ -123,7 +127,11 @@ class FeatureHolder():
         
         num_alignments = np.array(3)
 
-        asym_id = np.concatenate([np.full((self.binderlen), 1), np.full((self.targetlen), 2)])
+        if self.monomer:
+            asym_id = np.ones(self.querylen)
+        else:
+            asym_id = np.concatenate([np.full((self.binderlen), 1), np.full((self.targetlen), 2)])
+        
         entity_id = asym_id
         sym_id = np.full((self.querylen), 1)
 
@@ -160,7 +168,7 @@ class FeatureHolder():
                        }
 
         # Pad MSA to avoid zero-sized extra_msa.
-        feature_dict = pipeline_multimer.pad_msa(feature_dict, 512)
+        feature_dict = pipeline_multimer.pad_msa(feature_dict, 16)
 
         return feature_dict
 
@@ -183,6 +191,9 @@ class AF2_runner():
         self.model_name = args.weights
 
         self.fix_binder = args.fix_binder
+
+        self.force_monomer = args.force_monomer
+        self.save_score_dir = args.save_score_dir
 
         model_config = config.model_config(self.model_name)        
         model_config.model.num_ensemble_eval = 1
@@ -237,11 +248,23 @@ class AF2_runner():
                         self.max_amide_dist
                     )
 
+        # Always use residue offset (in case of force_monomer)
         feature_dict['residue_index'] = af2_util.insert_truncations(feature_dict['residue_index'], breaks)
 
         feature_dict = self.model_runner.process_features(feature_dict, random_seed=0)
 
         return feature_dict, initial_guess 
+
+
+    def _calculate_iptm(self, feat_holder, logits, breaks):
+        asym_id = np.concatenate([np.zeros(feat_holder.binderlen), 
+                                  np.ones(feat_holder.targetlen)])
+        iptm = confidence.predicted_tm_score(
+                    logits=logits,
+                    breaks=breaks,
+                    asym_id=asym_id,
+                    interface=True)
+        return iptm
 
 
     def generate_scoredict(self, feat_holder, confidences, rmsds) -> None:
@@ -268,6 +291,13 @@ class AF2_runner():
 
         time = timer() - self.t0
 
+        if feat_holder.monomer:
+            iptm = self._calculate_iptm(feat_holder, 
+                                        confidences['pae_logits'], 
+                                        confidences['pae_breaks'])
+        else:
+            iptm = confidences['iptm']
+
         score_dict = {
                 "plddt_total" : plddt,
                 "plddt_binder" : plddt_binder,
@@ -275,7 +305,7 @@ class AF2_runner():
                 "pae_binder" : pae_binder,
                 "pae_target" : pae_target,
                 "pae_interaction" : pae_interaction_total,
-                "iptm": confidences['iptm'],
+                "iptm": iptm,
                 "ptm": confidences['ptm'],
                 "binder_aligned_rmsd": rmsds['binder_aligned_rmsd'],
                 "target_aligned_rmsd": rmsds['target_aligned_rmsd'],                
@@ -292,6 +322,15 @@ class AF2_runner():
 
         print(f"Tag: {feat_holder.outtag} reported success in {time} seconds")
 
+        dump_score_dict = score_dict.copy()
+
+        if self.save_score_dir != '': # save scores to file if needed
+            dump_score_dict['pae'] = pae.copy()
+            dump_score_dict['plddt'] = confidences['plddt'].copy()
+            os.makedirs(self.save_score_dir, exist_ok=True)
+            with open(os.path.join(self.save_score_dir, feat_holder.outtag + '.pkl'), 'wb') as f:
+                pickle.dump(dump_score_dict, f)
+
 
     def process_output(self, feat_holder, feature_dict, prediction_result) -> None:
         '''
@@ -306,7 +345,9 @@ class AF2_runner():
                        'predicted_aligned_error':prediction_result['predicted_aligned_error'],
                        'ptm':prediction_result['ptm'],
                        'iptm':prediction_result['iptm'],
-                       'ranking_confidence':prediction_result['ranking_confidence']
+                       'ranking_confidence':prediction_result['ranking_confidence'],
+                       'pae_breaks': prediction_result['pae_breaks'],
+                       'pae_logits': prediction_result['pae_logits']
                       }
 
         this_protein = protein.Protein(
@@ -354,6 +395,9 @@ class AF2_runner():
         pose, monomer, binderlen, usetag = self.struct_manager.load_pose(tag)
 
         # Store the pose in the feature holder
+        if self.force_monomer:
+            monomer = True
+
         feat_holder = FeatureHolder(pose, monomer, binderlen, usetag)
 
         print(f'Processing struct with tag: {feat_holder.tag}')
